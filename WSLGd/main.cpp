@@ -7,6 +7,7 @@
 #define CONFIG_FILE ".wslgconfig"
 #define SHARE_PATH "/mnt/wslg"
 #define MSRDC_EXE "msrdc.exe"
+#define WESTON_NOTIFY_SOCKET SHARE_PATH "/weston-notify.sock"
 
 constexpr auto c_serviceIdTemplate = "%08X-FACB-11E6-BD58-64006A7986D3";
 constexpr auto c_userName = "wslg";
@@ -81,21 +82,21 @@ std::string TranslateWindowsPath(const char * Path)
 
 bool GetEnvBool(const char *EnvName, bool DefaultValue)
 {
-	char *s;
+    char *s;
 
-	s = getenv(EnvName);
-	if (s) {
-		if (strcmp(s, "true") == 0)
-			return true;
-		else if (strcmp(s, "false") == 0)
-			return false;
-		else if (strcmp(s, "1") == 0)
-			return true;
-		else if (strcmp(s, "0") == 0)
-			return false;
-	}
+    s = getenv(EnvName);
+    if (s) {
+        if (strcmp(s, "true") == 0)
+            return true;
+        else if (strcmp(s, "false") == 0)
+            return false;
+        else if (strcmp(s, "1") == 0)
+            return true;
+        else if (strcmp(s, "0") == 0)
+            return false;
+    }
 
-	return DefaultValue;
+    return DefaultValue;
 }
 
 void SetupOptionalEnv()
@@ -130,6 +131,33 @@ void SetupOptionalEnv()
 #endif // HAVE_WINPR
 
     return;
+}
+
+int SetupReadyNotify(const char *socket_path)
+{
+    struct sockaddr_un addr = {};
+    socklen_t size, name_size;
+
+    addr.sun_family = AF_LOCAL;
+    name_size = snprintf(addr.sun_path, sizeof addr.sun_path,
+                         "%s", socket_path) + 1;
+    size = offsetof(struct sockaddr_un, sun_path) + name_size;
+    unlink(addr.sun_path);
+
+    wil::unique_fd socketFd{socket(PF_LOCAL, SOCK_SEQPACKET, 0)};
+    THROW_LAST_ERROR_IF(!socketFd);
+
+    THROW_LAST_ERROR_IF(bind(socketFd.get(), reinterpret_cast<const sockaddr*>(&addr), size) < 0);
+    THROW_LAST_ERROR_IF(listen(socketFd.get(), 1) < 0);
+
+    return socketFd.release();
+}
+
+void WaitForReadyNotify(int notifyFd)
+{
+    // wait under client connects */
+    wil::unique_fd fd(accept(notifyFd, 0, 0));
+    THROW_LAST_ERROR_IF(!fd);
 }
 
 int main(int Argc, char *Argv[])
@@ -246,7 +274,6 @@ try {
         {"USE_VSOCK", socketFdString.c_str(), true},
         {"WSL2_DEFAULT_APP_ICON", "/usr/share/icons/wsl/linux.png", false},
         {"WSL2_DEFAULT_APP_OVERLAY_ICON", "/usr/share/icons/wsl/linux.png", false},
-        {"WESTON_DISABLE_ABSTRACT_FD", "1", true}
     };
 
     for (auto &var : variables) {
@@ -322,19 +349,35 @@ try {
         westonLoggerOption += c_westonRdprailShell;
     }
 
+    // Setup notify for wslgd-notify.so
+    wil::unique_fd notifyFd(SetupReadyNotify(WESTON_NOTIFY_SOCKET));
+    THROW_LAST_ERROR_IF(!notifyFd);
+
     // Launch weston.
     // N.B. Additional capabilities are needed to setns to the mount namespace of the user distro.
     monitor.LaunchProcess(std::vector<std::string>{
-        "/usr/bin/weston",
-        "--backend=rdp-backend.so",
-        "--xwayland",
-        std::move(westonSocketOption),
-        std::move(westonShellOption),
-        std::move(westonLoggerOption),
-        "--log=" SHARE_PATH "/weston.log"
+            "/usr/bin/weston",
+            "--modules=wslgd-notify.so",
+            "--backend=rdp-backend.so",
+            "--xwayland",
+            std::move(westonSocketOption),
+            std::move(westonShellOption),
+            std::move(westonLoggerOption),
+            "--log=" SHARE_PATH "/weston.log"
         },
-        std::vector<cap_value_t>{CAP_SYS_ADMIN, CAP_SYS_CHROOT, CAP_SYS_PTRACE}
+        std::vector<cap_value_t>{
+            CAP_SYS_ADMIN,
+            CAP_SYS_CHROOT,
+            CAP_SYS_PTRACE},
+        std::vector<std::string>{
+            "WSLGD_NOTIFY_SOCKET=" WESTON_NOTIFY_SOCKET,
+            "WESTON_DISABLE_ABSTRACT_FD=1"
+        }
     );
+
+    // Wait weston to be ready before starting RDP client, pulseaudio server.
+    WaitForReadyNotify(notifyFd.get());
+    unlink(WESTON_NOTIFY_SOCKET);
 
     // Launch the mstsc/msrdc client.
     std::string remote("/v:");
@@ -387,8 +430,6 @@ try {
         },
         std::vector<cap_value_t>{CAP_SETGID, CAP_SETUID}
     );
-
-    sleep(3);
 
     // Launch pulseaudio and the associated dbus daemon.
     monitor.LaunchProcess(std::vector<std::string>{
